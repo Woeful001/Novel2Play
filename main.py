@@ -2,19 +2,19 @@ import os
 import json
 import argparse
 from pathlib import Path
+from collections import OrderedDict
 
 import requests
 import yaml
 from dotenv import load_dotenv
 
-# 加载 .env 文件中的环境变量
 load_dotenv()
 
-# DeepSeek API 配置
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
-SYSTEM_PROMPT = """
+# 基础提示词（不含状态部分）
+BASE_SYSTEM_PROMPT = """
 你是一个专业的剧本改编专家。请将小说片段转换为**分场剧本**，输出严格的 JSON 格式，不要有任何额外文字。
 
 输出 JSON 结构如下：
@@ -25,33 +25,91 @@ SYSTEM_PROMPT = """
     ],
     "scenes": [
         {
-            "scene_id": 1,
+            "scene_id": 整数,
             "location": "地点",
-            "time": "时间段（如白天/夜晚/雨夜）",
-            "description": "场景的视觉和氛围描述（一两句话）",
+            "time": "时间段",
+            "description": "场景视觉和氛围描述（一两句话）",
             "elements": [
-                { "type": "action", "content": "动作描述（无对话时的行为、表情、环境变化）" },
-                { "type": "line", "speaker": "说话人", "text": "台词原文", "action": "说话时的动作", "emotion": "情绪" },
-                { "type": "narrate", "content": "旁白/内心独白/画外音（只在必要时使用）", "voice": "语气" }
+                { "type": "action", "content": "动作描述" },
+                { "type": "line", "speaker": "说话人", "text": "台词原文", "action": "动作", "emotion": "情绪" },
+                { "type": "narrate", "content": "旁白", "voice": "语气" }
             ]
         }
     ]
 }
 
 **创作要求**：
-1. **按原文的时间顺序划分场景**：地点或时间变化时，开启新 scene。每个 scene 的 elements 数组按原文顺序依次放入动作、对白、旁白。
-2. **旁白（narrate）尽可能少**：除非是重要的心理活动、无法表演的环境描写或过渡说明，否则不要使用旁白。能用动作和对白表现的，一律写成 action 或 line。
-3. **动作要具体**：写清楚角色做了什么、表情如何、与环境的互动。例如“安子低下头，手指抠着盒子边缘”而不是“安子不高兴”。
-4. **对白保留原文**，并为每句对白添加简单的动作和情绪。
-5. **角色描述精简**：每个角色用一句话点明外貌、身份、性格即可，不要展开长篇。
-6. **每段小说文本尽量输出 3~5 个 scene**，每个 scene 的 elements 数量不限，但要保证原文所有重要情节都覆盖。
-
-**输入的小说片段**：
+1. 严格按原文顺序划分场景，地点或时间变化时开启新 scene。
+2. 旁白尽可能少，能用动作和对白表现的绝不使用旁白。
+3. 动作要具体，对白保留原文并添加动作和情绪。
+4. 角色描述精简（一句话）。
+5. 如果提供了【已有角色列表】，请复用它们，不要创造重复角色。
+6. 如果提供了【下一个场景编号】，请从该编号开始递增。
+7. 如果提供了【剧情摘要】，请确保新内容与摘要衔接自然。
 """
 
 
+class State:
+    def __init__(self):
+        self.characters = OrderedDict()   # name -> description
+        self.next_scene_id = 1
+        self.last_summary = ""            # 上一段的剧情摘要
+        self.global_title = "未命名"
+
+    def update_from_script(self, script_data):
+        """从模型返回的剧本中提取信息，更新状态"""
+        # 更新标题（优先用第一个非空的）
+        if script_data.get("title") and self.global_title == "未命名":
+            self.global_title = script_data["title"]
+
+        # 合并角色
+        for char in script_data.get("characters", []):
+            name = char["name"]
+            if name not in self.characters:
+                self.characters[name] = char["description"]
+            else:
+                # 如果新描述更长，更新
+                if len(char.get("description", "")) > len(self.characters[name]):
+                    self.characters[name] = char["description"]
+
+        # 更新下一个场景编号（取所有场景中最大的 scene_id + 1）
+        max_id = max([s.get("scene_id", 0) for s in script_data.get("scenes", [])], default=0)
+        if max_id >= self.next_scene_id:
+            self.next_scene_id = max_id + 1
+
+        # 更新剧情摘要：取本段最后几个场景的简短描述（最多200字）
+        if script_data.get("scenes"):
+            last_scene = script_data["scenes"][-1]
+            summary = f"场景{last_scene.get('scene_id')}：{last_scene.get('location')}，{last_scene.get('description')}。"
+            # 再加上最后两句台词或动作
+            elements = last_scene.get("elements", [])
+            last_elems = [e for e in elements if e.get("type") in ("line", "action")][-2:]
+            for e in last_elems:
+                if e["type"] == "line":
+                    summary += f" {e['speaker']}说：“{e['text'][:30]}”"
+                else:
+                    summary += f" {e['content'][:30]}"
+            self.last_summary = summary[:200]
+
+    def get_context_prompt(self):
+        """生成供模型使用的上下文提示"""
+        if not self.characters and self.next_scene_id == 1:
+            return ""  # 第一次调用，无需上下文
+
+        context = "\n【已有角色列表】（请复用，不要改名）：\n"
+        for name, desc in self.characters.items():
+            context += f"- {name}：{desc}\n"
+
+        context += f"\n【下一个场景编号从 {self.next_scene_id} 开始】\n"
+
+        if self.last_summary:
+            context += f"\n【上一段剧情摘要】：{self.last_summary}\n"
+
+        context += "\n请继续处理以下小说片段，保持角色和情节一致。\n"
+        return context
+
+
 def read_novel(file_path: str) -> str:
-    """读取小说文本文件"""
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"小说文件不存在: {file_path}")
@@ -59,8 +117,25 @@ def read_novel(file_path: str) -> str:
         return f.read()
 
 
-def call_deepseek(novel_content: str, api_key: str, max_tokens: int = 4000) -> dict:
-    """调用 DeepSeek API，返回解析后的 JSON 对象"""
+def split_text(text, max_chars=2500):
+    """按段落切分，每块不超过 max_chars"""
+    paragraphs = text.split('\n')
+    chunks = []
+    current = ""
+    for para in paragraphs:
+        if len(current) + len(para) + 1 <= max_chars:
+            current += para + "\n"
+        else:
+            if current:
+                chunks.append(current.strip())
+            current = para + "\n"
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+
+def call_deepseek(prompt: str, api_key: str, max_tokens: int = 4000) -> dict:
+    """调用 API，prompt 是 user 消息内容（包含上下文和小说片段）"""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -68,76 +143,98 @@ def call_deepseek(novel_content: str, api_key: str, max_tokens: int = 4000) -> d
     payload = {
         "model": "deepseek-chat",
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": novel_content}
+            {"role": "system", "content": BASE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
         ],
         "temperature": 0.3,
         "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"}  # 强制 JSON 输出
+        "response_format": {"type": "json_object"}
     }
-
     try:
-        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=60)
+        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120)
         response.raise_for_status()
         result = response.json()
-        # 提取模型返回的内容
         content = result["choices"][0]["message"]["content"]
-        # 解析 JSON
-        data = json.loads(content)
-        return data
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"API 请求失败: {e}")
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"模型返回的不是有效 JSON: {e}\n原始内容: {content}")
-
-
-def save_to_yaml(data: dict, output_path: str):
-    """将字典保存为 YAML 文件"""
-    with open(output_path, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, allow_unicode=True, sort_keys=False, indent=2)
-    print(f"✅ 剧本已保存到: {output_path}")
+        # 清理 markdown
+        content = content.strip()
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        return json.loads(content)
+    except Exception as e:
+        raise RuntimeError(f"API 调用失败: {e}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AI小说转剧本工具")
-    parser.add_argument("--input", "-i", default="novel.txt", help="输入小说文件路径 (默认: novel.txt)")
-    parser.add_argument("--output", "-o", default="script.yaml", help="输出 YAML 文件路径 (默认: script.yaml)")
-    parser.add_argument("--max-tokens", type=int, default=8000, help="API 最大输出 token 数 (默认: 5000)")
+    parser = argparse.ArgumentParser(description="AI小说转剧本工具（上下文感知）")
+    parser.add_argument("--input", "-i", default="novel.txt", help="输入小说文件")
+    parser.add_argument("--output", "-o", default="script.yaml", help="输出 YAML 文件")
+    parser.add_argument("--max-tokens", type=int, default=8000, help="每块 API 最大输出 token")
+    parser.add_argument("--chunk-size", type=int, default=4000, help="每块文本最大字符数")
     args = parser.parse_args()
 
-    # 检查 API Key
     if not DEEPSEEK_API_KEY:
-        print("❌ 错误: 未找到 DeepSeek API Key。")
-        print("   请复制 .env.example 为 .env，并填入你的真实 API Key。")
+        print("❌ 请配置 .env 中的 DEEPSEEK_API_KEY")
         return
 
-    # 1. 读取小说
-    try:
-        print(f"📖 正在读取小说: {args.input}")
-        novel_text = read_novel(args.input)
-        if len(novel_text) < 50:
-            print("⚠️ 警告: 小说内容过短，可能影响转换效果。")
-    except FileNotFoundError as e:
-        print(f"❌ {e}")
-        print("   请确保小说文件存在，或使用 --input 指定路径。")
-        return
+    # 读取全文
+    full_text = read_novel(args.input)
+    chunks = split_text(full_text, max_chars=args.chunk_size)
+    print(f"📖 原文 {len(full_text)} 字符，拆分为 {len(chunks)} 块")
 
-    # 2. 调用 DeepSeek
-    print(f"🤖 正在调用 DeepSeek API (最长等待 {args.max_tokens} tokens)...")
-    try:
-        script_data = call_deepseek(novel_text, DEEPSEEK_API_KEY, args.max_tokens)
-    except RuntimeError as e:
-        print(f"❌ {e}")
-        return
+    state = State()
+    all_scripts = []  # 保存每个块返回的原始剧本（用于最终合并）
 
-    # 3. 保存 YAML
-    save_to_yaml(script_data, args.output)
+    for idx, chunk in enumerate(chunks, 1):
+        print(f"\n🔄 处理第 {idx}/{len(chunks)} 块...")
+        # 构造带上下文的 prompt
+        context = state.get_context_prompt()
+        user_prompt = f"{context}\n【待处理的小说片段】：\n{chunk}"
+        try:
+            script = call_deepseek(user_prompt, DEEPSEEK_API_KEY, args.max_tokens)
+            # 验证必要字段
+            if "scenes" not in script:
+                script["scenes"] = []
+            if "characters" not in script:
+                script["characters"] = []
+            all_scripts.append(script)
+            # 更新状态
+            state.update_from_script(script)
+            print(f"   ✅ 完成，本块场景数 {len(script['scenes'])}，累计角色 {len(state.characters)}")
+        except Exception as e:
+            print(f"   ❌ 失败：{e}")
+            return
 
-    # 4. 输出简要统计
-    print("\n📊 转换统计:")
-    print(f"   - 角色数: {len(script_data.get('characters', []))}")
-    print(f"   - 场景数: {len(script_data.get('scenes', []))}")
-    print(f"   - 台词数: {len(script_data.get('lines', []))}")
+    # 合并所有块的剧本（简单拼接，因为 scene_id 已经由状态控制连续）
+    final_scenes = []
+    for script in all_scripts:
+        final_scenes.extend(script.get("scenes", []))
+    final_characters = [{"name": n, "description": d} for n, d in state.characters.items()]
+
+    final_script = {
+        "title": state.global_title,
+        "characters": final_characters,
+        "scenes": final_scenes
+    }
+
+    # 保存 YAML
+    with open(args.output, "w", encoding="utf-8") as f:
+        yaml.dump(final_script, f, allow_unicode=True, sort_keys=False, indent=2)
+
+    total_lines = sum(
+        1 for scene in final_scenes
+        for elem in scene.get("elements", [])
+        if elem.get("type") == "line"
+    )
+    print("\n📊 最终统计:")
+    print(f"   - 总角色: {len(final_characters)}")
+    print(f"   - 总场景: {len(final_scenes)}")
+    print(f"   - 总台词: {total_lines}")
+    print(f"✅ 剧本保存至 {args.output}")
 
 
 if __name__ == "__main__":
