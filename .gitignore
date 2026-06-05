@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 .DS_Store
 novel.txt
+novel.md
+novel.docx
+script.yaml

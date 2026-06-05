@@ -8,6 +8,31 @@ import requests
 import yaml
 from dotenv import load_dotenv
 
+# 尝试导入可选解析库
+try:
+    import docx
+except ImportError:
+    docx = None
+
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
+    import ebooklib
+    from ebooklib import epub
+except ImportError:
+    ebooklib = None
+
+# 尝试导入 tkinter（用于文件选择对话框）
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+    TKINTER_AVAILABLE = True
+except ImportError:
+    TKINTER_AVAILABLE = False
+
 load_dotenv()
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -110,14 +135,61 @@ class State:
 
 
 def read_novel(file_path: str) -> str:
+    """
+    读取多种格式的小说文件，返回纯文本内容。
+    支持格式：.txt, .md, .docx, .pdf, .epub
+    """
     path = Path(file_path)
     if not path.exists():
-        raise FileNotFoundError(f"小说文件不存在: {file_path}")
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+        raise FileNotFoundError(f"文件不存在: {file_path}")
+
+    suffix = path.suffix.lower()
+
+    # 纯文本格式
+    if suffix in ('.txt', '.md'):
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    # Microsoft Word
+    elif suffix == '.docx':
+        if docx is None:
+            raise ImportError("需要安装 python-docx 库：pip install python-docx")
+        doc = docx.Document(path)
+        paragraphs = [p.text for p in doc.paragraphs]
+        return '\n'.join(paragraphs)
+
+    # PDF
+    elif suffix == '.pdf':
+        if pdfplumber is None:
+            raise ImportError("需要安装 pdfplumber 库：pip install pdfplumber")
+        text = ''
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + '\n'
+        return text
+
+    # EPUB
+    elif suffix == '.epub':
+        if ebooklib is None:
+            raise ImportError("需要安装 EbookLib 库：pip install EbookLib")
+        book = epub.read_epub(path)
+        text = ''
+        for item in book.get_items():
+            if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                content = item.get_body_content().decode('utf-8', errors='ignore')
+                # 去除简单 HTML 标签
+                import re
+                clean = re.sub(r'<[^>]+>', ' ', content)
+                text += clean + '\n'
+        return text
+
+    else:
+        raise ValueError(f"不支持的文件格式: {suffix}，目前支持 .txt, .md, .docx, .pdf, .epub")
 
 
-def split_text(text, max_chars=2500):
+def split_text(text, max_chars=4000):
     """按段落切分，每块不超过 max_chars"""
     paragraphs = text.split('\n')
     chunks = []
@@ -134,14 +206,14 @@ def split_text(text, max_chars=2500):
     return chunks
 
 
-def call_deepseek(prompt: str, api_key: str, max_tokens: int = 4000) -> dict:
+def call_deepseek(prompt: str, api_key: str, max_tokens: int = 8000) -> dict:
     """调用 API，prompt 是 user 消息内容（包含上下文和小说片段）"""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "deepseek-chat",
+        "model": "deepseek-chat",  # 使用 chat 模型，性价比高
         "messages": [
             {"role": "system", "content": BASE_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
@@ -169,9 +241,34 @@ def call_deepseek(prompt: str, api_key: str, max_tokens: int = 4000) -> dict:
         raise RuntimeError(f"API 调用失败: {e}")
 
 
+def select_file() -> str | None:
+    """弹出文件选择对话框，返回选中的文件路径，若取消则返回 None"""
+    if not TKINTER_AVAILABLE:
+        print("⚠️ tkinter 不可用（可能在没有图形界面的环境中运行），请通过命令行参数 --input 指定文件。")
+        return None
+
+    root = tk.Tk()
+    root.withdraw()  # 隐藏主窗口
+    # 设置支持的文件类型
+    filetypes = [
+        ("所有支持的文件", "*.txt *.md *.docx *.pdf *.epub"),
+        ("文本文件", "*.txt *.md"),
+        ("Word 文档", "*.docx"),
+        ("PDF 文件", "*.pdf"),
+        ("EPUB 电子书", "*.epub"),
+        ("所有文件", "*.*")
+    ]
+    file_path = filedialog.askopenfilename(
+        title="请选择小说文件",
+        filetypes=filetypes
+    )
+    root.destroy()
+    return file_path if file_path else None
+
+
 def main():
-    parser = argparse.ArgumentParser(description="AI小说转剧本工具（上下文感知）")
-    parser.add_argument("--input", "-i", default="novel.txt", help="输入小说文件")
+    parser = argparse.ArgumentParser(description="AI小说转剧本工具（支持多格式 + 图形化文件选择）")
+    parser.add_argument("--input", "-i", help="输入小说文件路径（如果未提供，将弹出文件选择对话框）")
     parser.add_argument("--output", "-o", default="script.yaml", help="输出 YAML 文件")
     parser.add_argument("--max-tokens", type=int, default=8000, help="每块 API 最大输出 token")
     parser.add_argument("--chunk-size", type=int, default=4000, help="每块文本最大字符数")
@@ -181,8 +278,25 @@ def main():
         print("❌ 请配置 .env 中的 DEEPSEEK_API_KEY")
         return
 
-    # 读取全文
-    full_text = read_novel(args.input)
+    # 确定输入文件路径
+    input_file = args.input
+    if not input_file:
+        # 尝试弹出图形化选择对话框
+        print("🔍 未提供 --input 参数，正在打开文件选择对话框...")
+        input_file = select_file()
+        if not input_file:
+            print("❌ 未选择任何文件，程序退出。")
+            return
+        print(f"✅ 已选择文件: {input_file}")
+
+    # 读取并解析小说内容
+    try:
+        full_text = read_novel(input_file)
+        print(f"📖 成功读取文件，共 {len(full_text)} 字符")
+    except Exception as e:
+        print(f"❌ 读取文件失败: {e}")
+        return
+
     chunks = split_text(full_text, max_chars=args.chunk_size)
     print(f"📖 原文 {len(full_text)} 字符，拆分为 {len(chunks)} 块")
 
@@ -191,25 +305,22 @@ def main():
 
     for idx, chunk in enumerate(chunks, 1):
         print(f"\n🔄 处理第 {idx}/{len(chunks)} 块...")
-        # 构造带上下文的 prompt
         context = state.get_context_prompt()
         user_prompt = f"{context}\n【待处理的小说片段】：\n{chunk}"
         try:
             script = call_deepseek(user_prompt, DEEPSEEK_API_KEY, args.max_tokens)
-            # 验证必要字段
             if "scenes" not in script:
                 script["scenes"] = []
             if "characters" not in script:
                 script["characters"] = []
             all_scripts.append(script)
-            # 更新状态
             state.update_from_script(script)
             print(f"   ✅ 完成，本块场景数 {len(script['scenes'])}，累计角色 {len(state.characters)}")
         except Exception as e:
             print(f"   ❌ 失败：{e}")
             return
 
-    # 合并所有块的剧本（简单拼接，因为 scene_id 已经由状态控制连续）
+    # 合并所有块的剧本
     final_scenes = []
     for script in all_scripts:
         final_scenes.extend(script.get("scenes", []))
