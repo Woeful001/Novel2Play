@@ -14,29 +14,39 @@ load_dotenv()
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
-# 系统提示词（固定，引导模型输出 JSON 格式的剧本结构）
 SYSTEM_PROMPT = """
-你是一个专业的剧本结构化专家。你的任务是将小说片段转换为结构化的剧本数据。
+你是一个专业的剧本改编专家。请将小说片段转换为**分场剧本**，输出严格的 JSON 格式，不要有任何额外文字。
 
-请严格按照以下 JSON 格式输出，不要输出任何其他文字、注释或 Markdown 标记：
+输出 JSON 结构如下：
 {
-    "title": "小说标题（如果无法确定，使用'未知标题'）",
+    "title": "剧本标题（根据内容推断）",
     "characters": [
-        {"name": "角色名", "description": "简短描述"}
+        {"name": "角色名", "description": "一句话外貌/性格/身份特点"}
     ],
     "scenes": [
-        {"location": "地点", "time": "时间（如白天/夜晚）", "description": "场景描述"}
-    ],
-    "lines": [
-        {"speaker": "说话人", "text": "台词内容", "action": "动作描述（可留空字符串）"}
+        {
+            "scene_id": 1,
+            "location": "地点",
+            "time": "时间段（如白天/夜晚/雨夜）",
+            "description": "场景的视觉和氛围描述（一两句话）",
+            "elements": [
+                { "type": "action", "content": "动作描述（无对话时的行为、表情、环境变化）" },
+                { "type": "line", "speaker": "说话人", "text": "台词原文", "action": "说话时的动作", "emotion": "情绪" },
+                { "type": "narrate", "content": "旁白/内心独白/画外音（只在必要时使用）", "voice": "语气" }
+            ]
+        }
     ]
 }
 
-要求：
-- 从文本中提取所有出现的主要角色。
-- 根据对话发生的环境推断场景。
-- 将对话转换为台词，叙述性文字可适当转换为动作描述。
-- 如果信息不足，某些字段可以为空数组或空字符串，但必须保持 JSON 结构完整。
+**创作要求**：
+1. **按原文的时间顺序划分场景**：地点或时间变化时，开启新 scene。每个 scene 的 elements 数组按原文顺序依次放入动作、对白、旁白。
+2. **旁白（narrate）尽可能少**：除非是重要的心理活动、无法表演的环境描写或过渡说明，否则不要使用旁白。能用动作和对白表现的，一律写成 action 或 line。
+3. **动作要具体**：写清楚角色做了什么、表情如何、与环境的互动。例如“安子低下头，手指抠着盒子边缘”而不是“安子不高兴”。
+4. **对白保留原文**，并为每句对白添加简单的动作和情绪。
+5. **角色描述精简**：每个角色用一句话点明外貌、身份、性格即可，不要展开长篇。
+6. **每段小说文本尽量输出 3~5 个 scene**，每个 scene 的 elements 数量不限，但要保证原文所有重要情节都覆盖。
+
+**输入的小说片段**：
 """
 
 
@@ -49,7 +59,7 @@ def read_novel(file_path: str) -> str:
         return f.read()
 
 
-def call_deepseek(novel_content: str, api_key: str, max_tokens: int = 2000) -> dict:
+def call_deepseek(novel_content: str, api_key: str, max_tokens: int = 4000) -> dict:
     """调用 DeepSeek API，返回解析后的 JSON 对象"""
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -92,7 +102,7 @@ def main():
     parser = argparse.ArgumentParser(description="AI小说转剧本工具")
     parser.add_argument("--input", "-i", default="novel.txt", help="输入小说文件路径 (默认: novel.txt)")
     parser.add_argument("--output", "-o", default="script.yaml", help="输出 YAML 文件路径 (默认: script.yaml)")
-    parser.add_argument("--max-tokens", type=int, default=2000, help="API 最大输出 token 数 (默认: 2000)")
+    parser.add_argument("--max-tokens", type=int, default=8000, help="API 最大输出 token 数 (默认: 5000)")
     args = parser.parse_args()
 
     # 检查 API Key
