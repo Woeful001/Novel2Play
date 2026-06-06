@@ -32,3 +32,10 @@ Thumbs.db
 
 # 日志文件
 *.log
+
+# 测试小说文件（避免误传）
+novel.txt
+novel.docx
+novel.pdf
+novel.epub
+test_*.txt
