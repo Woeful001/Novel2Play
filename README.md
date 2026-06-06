@@ -44,3 +44,5 @@
 3.导入pycharm或其他编辑器，下载requirements.txt里的依赖项
 
 4.运行main.py文件
+
+## 演示视频：https://www.bilibili.com/video/BV158EJ6FEUD/
