@@ -43,3 +43,5 @@
 3.在网页端输入自己的API Key，并上传小说文本文件；
 
 4.点击运行，生成剧本
+
+##演示视频：https://www.bilibili.com/video/BV158EJ6FEUD/
